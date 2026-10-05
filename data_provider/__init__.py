@@ -41,6 +41,8 @@ from .yfinance_fetcher import YfinanceFetcher
 from .longbridge_fetcher import LongbridgeFetcher
 from .finnhub_fetcher import FinnhubFetcher
 from .alphavantage_fetcher import AlphaVantageFetcher
+# 宏观/大宗序列：独立于上面的个股故障切换链，不参与 DataFetcherManager 优先级排序
+from .macro_fetcher import MacroFetcher, MacroSeries, SERIES_REGISTRY, DEFAULT_SNAPSHOT_KEYS
 from .us_index_mapping import is_us_index_code, is_us_stock_code, get_us_index_yf_symbol, US_INDEX_MAPPING
 
 __all__ = [
@@ -56,6 +58,10 @@ __all__ = [
     'LongbridgeFetcher',
     'FinnhubFetcher',
     'AlphaVantageFetcher',
+    'MacroFetcher',
+    'MacroSeries',
+    'SERIES_REGISTRY',
+    'DEFAULT_SNAPSHOT_KEYS',
     'is_us_index_code',
     'is_us_stock_code',
     'is_hk_stock_code',
