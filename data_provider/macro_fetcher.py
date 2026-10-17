@@ -32,6 +32,7 @@ from .base import STANDARD_COLUMNS, DataFetchError
 logger = logging.getLogger(__name__)
 
 _FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
+_EIA_BASE_URL = "https://api.eia.gov/v2/seriesid"
 _HTTP_TIMEOUT = 15
 _MAX_RETRIES = 3
 
@@ -70,10 +71,25 @@ _FRED_SERIES: Dict[str, MacroSeries] = {
         MacroSeries('unemployment', 'Unemployment Rate', 'fred', 'UNRATE', '%'),
         MacroSeries('fed_funds', 'Fed Funds Rate', 'fred', 'DFF', '%'),
         MacroSeries('real_10y', '10Y Real Yield (TIPS)', 'fred', 'DFII10', '%'),
+        MacroSeries('ust2y', 'US 2Y Treasury', 'fred', 'DGS2', '%'),
+        MacroSeries('breakeven_10y', '10Y Breakeven Inflation', 'fred', 'T10YIE', '%'),
     ]
 }
 
-SERIES_REGISTRY: Dict[str, MacroSeries] = {**_QUOTE_SERIES, **_FRED_SERIES}
+
+# 能源库存类（EIA 周度，需 API Key）
+# 柴油（distillate）库存是当前最关键的通胀传导渠道：
+# 原油回落时柴油仍偏紧会让 PPI 保持高位，进而压制黄金。
+_EIA_SERIES: Dict[str, MacroSeries] = {
+    s.key: s for s in [
+        MacroSeries('eia_crude', 'US Crude Stocks (ex-SPR)', 'eia', 'PET.WCESTUS1.W', 'kbbl'),
+        MacroSeries('eia_distillate', 'US Distillate Stocks', 'eia', 'PET.WDISTUS1.W', 'kbbl'),
+        MacroSeries('eia_gasoline', 'US Gasoline Stocks', 'eia', 'PET.WGTSTUS1.W', 'kbbl'),
+        MacroSeries('eia_spr', 'US SPR Stocks', 'eia', 'PET.WCSSTUS1.W', 'kbbl'),
+    ]
+}
+
+SERIES_REGISTRY: Dict[str, MacroSeries] = {**_QUOTE_SERIES, **_FRED_SERIES, **_EIA_SERIES}
 
 # 盘面快照的默认序列组合
 DEFAULT_SNAPSHOT_KEYS: List[str] = ['gold', 'silver', 'wti', 'brent', 'dxy', 'ust10y', 'ust30y']
@@ -84,22 +100,27 @@ class MacroFetcher:
 
     name = "MacroFetcher"
 
-    def __init__(self, fred_api_key: Optional[str] = None):
-        self._fred_api_key = fred_api_key or self._resolve_fred_key()
+    def __init__(self, fred_api_key: Optional[str] = None,
+                 eia_api_key: Optional[str] = None):
+        self._fred_api_key = fred_api_key or self._resolve_key('fred_api_key', 'FRED_API_KEY')
+        self._eia_api_key = eia_api_key or self._resolve_key('eia_api_key', 'EIA_API_KEY')
         if not self._fred_api_key:
             logger.debug("[Macro] FRED_API_KEY 未配置，官方宏观序列不可用（行情序列不受影响）")
+        if not self._eia_api_key:
+            logger.debug("[Macro] EIA_API_KEY 未配置，能源库存序列不可用（行情序列不受影响）")
 
     @staticmethod
-    def _resolve_fred_key() -> Optional[str]:
+    def _resolve_key(config_attr: str, env_var: str) -> Optional[str]:
+        """先读 src.config，失败则回退环境变量。配置缺失不应阻断行情序列。"""
         try:
             from src.config import get_config
             config = get_config()
-            key = getattr(config, 'fred_api_key', None)
+            key = getattr(config, config_attr, None)
             if key:
                 return key
         except Exception:  # noqa: BLE001 - 配置缺失不应阻断行情序列
-            logger.debug("[Macro] 读取 config 失败，回退到环境变量", exc_info=True)
-        return os.getenv('FRED_API_KEY') or None
+            logger.debug("[Macro] 读取 config 失败，回退到环境变量 %s", env_var, exc_info=True)
+        return os.getenv(env_var) or None
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -110,6 +131,8 @@ class MacroFetcher:
         series = list(_QUOTE_SERIES.values())
         if self._fred_api_key:
             series.extend(_FRED_SERIES.values())
+        if self._eia_api_key:
+            series.extend(_EIA_SERIES.values())
         return series
 
     def fetch(self, series_key: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -135,6 +158,8 @@ class MacroFetcher:
             raw = self._fetch_yfinance(series, start_date, end_date)
         elif series.source == 'fred':
             raw = self._fetch_fred(series, start_date, end_date)
+        elif series.source == 'eia':
+            raw = self._fetch_eia(series, start_date, end_date)
         else:  # pragma: no cover - 注册表受控，不应出现
             raise DataFetchError(f"[Macro] 不支持的数据源 '{series.source}'")
 
@@ -250,6 +275,35 @@ class MacroFetcher:
 
         raise DataFetchError(f"[Macro] FRED 获取 {series.symbol} 失败：{last_error}")
 
+    def _fetch_eia(self, series: MacroSeries, start_date: str, end_date: str) -> pd.DataFrame:
+        """EIA v2 seriesid 路由，返回周度库存观测。"""
+        if not self._eia_api_key:
+            raise DataFetchError(
+                f"[Macro] 序列 '{series.key}' 需要 EIA_API_KEY，请在 .env 中配置"
+            )
+
+        url = f"{_EIA_BASE_URL}/{series.symbol}"
+        params = {
+            'api_key': self._eia_api_key,
+            'start': start_date,
+            'end': end_date,
+        }
+
+        last_error: Optional[Exception] = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = requests.get(url, params=params, timeout=_HTTP_TIMEOUT)
+                resp.raise_for_status()
+                rows = (resp.json().get('response') or {}).get('data', [])
+                if rows:
+                    return pd.DataFrame(rows)
+                last_error = DataFetchError(f"[Macro] EIA 返回空数据：{series.symbol}")
+            except Exception as exc:  # noqa: BLE001 - 网络抖动重试
+                last_error = exc
+                logger.debug("[Macro] EIA %s 第 %d 次失败：%s", series.symbol, attempt + 1, exc)
+
+        raise DataFetchError(f"[Macro] EIA 获取 {series.symbol} 失败：{last_error}")
+
     # ------------------------------------------------------------------
     # 标准化
     # ------------------------------------------------------------------
@@ -260,7 +314,18 @@ class MacroFetcher:
         if df is None or df.empty:
             return pd.DataFrame(columns=STANDARD_COLUMNS)
 
-        if series.source == 'fred':
+        if series.source == 'eia':
+            out = pd.DataFrame()
+            out['date'] = pd.to_datetime(df['period']).dt.strftime('%Y-%m-%d')
+            close = pd.to_numeric(df['value'], errors='coerce')
+            out['open'] = close
+            out['high'] = close
+            out['low'] = close
+            out['close'] = close
+            out['volume'] = 0.0
+            out['amount'] = 0.0
+            out = out.dropna(subset=['close'])
+        elif series.source == 'fred':
             out = pd.DataFrame()
             out['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
             # FRED 用 '.' 表示缺失值
