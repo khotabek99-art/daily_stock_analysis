@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 修复 `--serve --schedule` 下 CLI 调度器与 Web/API runtime scheduler 状态脱节的问题，并避免设置页把失败执行时间显示为上次成功。
 - [修复] runtime scheduler 的立即执行接口在已有分析运行时返回 409 忙碌状态，Web 设置页不再把未排队的请求提示为已提交。
 - [修复] 避免 runtime scheduler 重建定时任务时重复立即运行事件监控，减少重复告警和后台任务状态丢失。
+- [新功能] 新增 `data_provider/macro_fetcher.py`（MacroFetcher），提供贵金属、原油、美元指数与美债收益率等宏观序列；默认走 yfinance 免配置可用，配置 `FRED_API_KEY` 后额外支持 PCE/CPI/失业率/实际利率等 FRED 官方序列。该 fetcher 不继承 BaseFetcher、不注册进个股故障切换链，仅复用 STANDARD_COLUMNS 列契约。
+- [新功能] MacroFetcher 扩展能源与利率维度：新增 EIA 周度库存序列（原油 / 柴油 / 汽油 / SPR，需 `EIA_API_KEY`），并补充 FRED 的 2 年期美债收益率与 10 年期盈亏平衡通胀。柴油库存用于观测油价向 PPI 的传导。
+- [新功能] MacroFetcher 新增 CFTC COT 周度持仓序列（黄金 / 白银非商业净持仓与总持仓量），走 CFTC Socrata 公共端点、无需 API Key，用于观测投机盘拥挤度。
 - [修复] Web/API runtime scheduler 接管 `--serve --schedule` 后保留 `--dry-run`、`--no-notify` 等启动参数语义。
 - [改进] Web 历史报告详情不再内嵌展示 AI 建议卡片，结构化决策信号集中在 AI 建议页查询，并保留按来源报告 ID 筛选或 URL 参数精确定位入口。
 - [改进] 新增 GenerationBackend Phase 1 抽象与 LiteLLM backend 配置，默认保持普通分析、`generate_text()` 和 Agent Chat 的 LiteLLM 行为不变。
