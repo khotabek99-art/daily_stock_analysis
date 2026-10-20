@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 _FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 _EIA_BASE_URL = "https://api.eia.gov/v2/seriesid"
+# CFTC Socrata 公共端点：无需 API Key
+_CFTC_BASE_URL = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
 _HTTP_TIMEOUT = 15
 _MAX_RETRIES = 3
 
@@ -89,7 +91,24 @@ _EIA_SERIES: Dict[str, MacroSeries] = {
     ]
 }
 
-SERIES_REGISTRY: Dict[str, MacroSeries] = {**_QUOTE_SERIES, **_FRED_SERIES, **_EIA_SERIES}
+
+# CFTC 持仓类（Commitments of Traders，周度，无需 API Key）
+# symbol 形如 "<合约代码>:<字段>"：
+#   noncomm_net   = 非商业（投机）净持仓 = 多头 - 空头，即市场常说的"管理基金净多"
+#   open_interest = 总持仓量
+# 合约代码来自 CFTC legacy futures-only 数据集；黄金 088691 已核对，
+# 其余代码如需扩展请先在 CFTC 站点确认。
+_COT_SERIES: Dict[str, MacroSeries] = {
+    s.key: s for s in [
+        MacroSeries('cot_gold_net', 'COT Gold Non-Comm Net', 'cftc', '088691:noncomm_net', 'contracts'),
+        MacroSeries('cot_gold_oi', 'COT Gold Open Interest', 'cftc', '088691:open_interest', 'contracts'),
+        MacroSeries('cot_silver_net', 'COT Silver Non-Comm Net', 'cftc', '084691:noncomm_net', 'contracts'),
+    ]
+}
+
+SERIES_REGISTRY: Dict[str, MacroSeries] = {
+    **_QUOTE_SERIES, **_COT_SERIES, **_FRED_SERIES, **_EIA_SERIES,
+}
 
 # 盘面快照的默认序列组合
 DEFAULT_SNAPSHOT_KEYS: List[str] = ['gold', 'silver', 'wti', 'brent', 'dxy', 'ust10y', 'ust30y']
@@ -128,7 +147,7 @@ class MacroFetcher:
 
     def available_series(self) -> List[MacroSeries]:
         """返回当前配置下真正可用的序列。"""
-        series = list(_QUOTE_SERIES.values())
+        series = list(_QUOTE_SERIES.values()) + list(_COT_SERIES.values())
         if self._fred_api_key:
             series.extend(_FRED_SERIES.values())
         if self._eia_api_key:
@@ -160,6 +179,8 @@ class MacroFetcher:
             raw = self._fetch_fred(series, start_date, end_date)
         elif series.source == 'eia':
             raw = self._fetch_eia(series, start_date, end_date)
+        elif series.source == 'cftc':
+            raw = self._fetch_cftc(series, start_date, end_date)
         else:  # pragma: no cover - 注册表受控，不应出现
             raise DataFetchError(f"[Macro] 不支持的数据源 '{series.source}'")
 
@@ -304,6 +325,40 @@ class MacroFetcher:
 
         raise DataFetchError(f"[Macro] EIA 获取 {series.symbol} 失败：{last_error}")
 
+    def _fetch_cftc(self, series: MacroSeries, start_date: str, end_date: str) -> pd.DataFrame:
+        """CFTC COT 周度持仓，Socrata 公共端点，无需 API Key。"""
+        try:
+            contract_code, _field = series.symbol.split(':', 1)
+        except ValueError as exc:
+            raise DataFetchError(
+                f"[Macro] COT symbol 需形如 '<合约代码>:<字段>'，实际为 '{series.symbol}'"
+            ) from exc
+
+        params = {
+            'cftc_contract_market_code': contract_code,
+            '$where': (
+                f"report_date_as_yyyy_mm_dd >= '{start_date}T00:00:00.000'"
+                f" AND report_date_as_yyyy_mm_dd <= '{end_date}T23:59:59.999'"
+            ),
+            '$order': 'report_date_as_yyyy_mm_dd ASC',
+            '$limit': 5000,
+        }
+
+        last_error: Optional[Exception] = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = requests.get(_CFTC_BASE_URL, params=params, timeout=_HTTP_TIMEOUT)
+                resp.raise_for_status()
+                rows = resp.json()
+                if rows:
+                    return pd.DataFrame(rows)
+                last_error = DataFetchError(f"[Macro] CFTC 返回空数据：{series.symbol}")
+            except Exception as exc:  # noqa: BLE001 - 网络抖动重试
+                last_error = exc
+                logger.debug("[Macro] CFTC %s 第 %d 次失败：%s", series.symbol, attempt + 1, exc)
+
+        raise DataFetchError(f"[Macro] CFTC 获取 {series.symbol} 失败：{last_error}")
+
     # ------------------------------------------------------------------
     # 标准化
     # ------------------------------------------------------------------
@@ -314,7 +369,24 @@ class MacroFetcher:
         if df is None or df.empty:
             return pd.DataFrame(columns=STANDARD_COLUMNS)
 
-        if series.source == 'eia':
+        if series.source == 'cftc':
+            _code, field = series.symbol.split(':', 1)
+            if field == 'noncomm_net':
+                longs = pd.to_numeric(df.get('noncomm_positions_long_all'), errors='coerce')
+                shorts = pd.to_numeric(df.get('noncomm_positions_short_all'), errors='coerce')
+                close = longs - shorts
+            else:
+                close = pd.to_numeric(df.get('open_interest_all'), errors='coerce')
+            out = pd.DataFrame()
+            out['date'] = pd.to_datetime(df['report_date_as_yyyy_mm_dd']).dt.strftime('%Y-%m-%d')
+            out['open'] = close
+            out['high'] = close
+            out['low'] = close
+            out['close'] = close
+            out['volume'] = 0.0
+            out['amount'] = 0.0
+            out = out.dropna(subset=['close'])
+        elif series.source == 'eia':
             out = pd.DataFrame()
             out['date'] = pd.to_datetime(df['period']).dt.strftime('%Y-%m-%d')
             close = pd.to_numeric(df['value'], errors='coerce')
